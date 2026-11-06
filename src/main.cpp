@@ -19,6 +19,7 @@ static bool initialized = false;
 static bool microphoneOpen = false;
 static uint8_t stream = 0;
 static uint32_t recordingStarted = 0, requestStarted = 0, playbackStarted = 0, lastDisplay = 0;
+static uint32_t playbackTimeout = 0;
 static std::array<int16_t, 240> frame{};
 static char detail[96] = "Hold B for explicit pairing";
 
@@ -73,6 +74,7 @@ static void outputControl(const WriteEvent& event) {
         if (!playback.finish(id)) return;
         if (!device.play(playback.audio(), playback.samples(), playback.volume())) { playback.fail(PlaybackError::Audio); return; }
         playback.playing(); playbackStarted = millis();
+        playbackTimeout = (playback.samples() + 15) / 16 + 5000;
         transition(State::Playing, "CRC verified; speaker active");
     } else if (event.size == 6 && bytes[1] == 3) {
         if (id != playback.id()) return;
@@ -137,6 +139,7 @@ static void serialCommand() {
                     tone.encode(samples, 2, encoded + position / 2);
                 }
                 playbackStarted = millis();
+                playbackTimeout = 6000;
                 if (device.play(encoded, 16000, 10)) transition(State::Playing, "Local 440 Hz test; low volume (10%)");
                 heap_caps_free(encoded);
             }
@@ -157,15 +160,16 @@ void loop() {
     device.update();
     ble.tick(); serialCommand();
     if (device.pairRequested()) ble.pairing();
+    const bool changed = ble.sessionChanged();
     const bool connected = ble.connected();
-    if (connected != wasConnected) {
+    if (changed || connected != wasConnected) {
         wasConnected = connected;
-        if (!connected) {
-            device.stopCapture(); interruptPlayback(); playback.fail(PlaybackError::Disconnected);
-            negotiated = false; requested = false; microphoneOpen = false; serialHeld = false; frame.fill(0);
-            WriteEvent discarded; while (ble.pop(discarded)) {}
-            transition(State::Disconnected, "Disconnected: recording and playback discarded");
-        } else transition(State::Ready, "Encrypted bonded connection; waiting ATVV");
+        device.stopCapture(); device.stopPlayback(); playback.fail(PlaybackError::Disconnected);
+        playback.notification(); // Never deliver the old session's status to a new peer.
+        negotiated = false; requested = false; microphoneOpen = false; serialHeld = false; frame.fill(0);
+        held = device.talkPressed();
+        transition(connected ? State::Ready : State::Disconnected,
+            connected ? "Encrypted bonded connection; waiting ATVV" : "Disconnected: recording and playback discarded");
         device.prepareMicrophone();
     }
     if (ble.overflowed()) { device.stopCapture(); interruptPlayback(); ble.disconnect(); transition(State::Error, "BLE queue overflow; recording discarded"); }
@@ -210,18 +214,22 @@ void loop() {
     }
     if (requested && state != State::Recording && millis() - requestStarted >= 5000) { requested = false; microphoneOpen = false; transition(State::Error, "ATVV microphone open timed out"); }
     playback.tick(millis());
+    if (state == State::Playing) {
+        if (device.playbackFinished()) {
+            playback.completed();
+            Serial.printf("PLAYBACK completed id=%lu duration_ms=%lu\n", static_cast<unsigned long>(playback.id()), static_cast<unsigned long>(millis() - playbackStarted));
+            transition(connected ? State::Ready : State::Disconnected, "Speaker playback complete"); device.prepareMicrophone();
+        } else if (millis() - playbackStarted >= playbackTimeout) playback.fail(PlaybackError::Timeout);
+    }
     if (playback.notification()) {
         ble.sendStatus(playback.status());
         if (playback.state() == PlaybackState::Error) {
             device.stopPlayback();
-            if (state != State::Recording) { transition(State::Error, "Playback rejected; buffer cleared"); device.prepareMicrophone(); }
+            if (state != State::Recording) {
+                transition(State::Error, playback.error() == PlaybackError::Timeout ? "Playback timed out; buffer cleared" : "Playback rejected; buffer cleared");
+                device.prepareMicrophone();
+            }
         }
-    }
-    if (state == State::Playing && device.playbackFinished()) {
-        playback.completed();
-        ble.sendStatus(playback.status());
-        Serial.printf("PLAYBACK completed id=%lu duration_ms=%lu\n", static_cast<unsigned long>(playback.id()), static_cast<unsigned long>(millis() - playbackStarted));
-        transition(connected ? State::Ready : State::Disconnected, "Speaker playback complete"); device.prepareMicrophone();
     }
     if (ble.pairingActive() && millis() - lastDisplay >= 500) {
         lastDisplay = millis();
