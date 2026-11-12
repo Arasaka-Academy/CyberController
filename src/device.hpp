@@ -23,6 +23,7 @@ public:
     virtual void stopCapture() = 0;
     virtual bool play(const uint8_t* encoded, uint32_t samples, uint8_t volume) = 0;
     virtual bool playbackFinished() = 0;
+    virtual bool playbackHealthy() const { return true; }
     virtual void stopPlayback() = 0;
 };
 

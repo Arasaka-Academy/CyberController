@@ -1,20 +1,13 @@
 #pragma once
 
 #include <Arduino.h>
+#include "transport.hpp"
 #include <NimBLEDevice.h>
 #include <atomic>
 #include <array>
 #include <mutex>
 
 namespace cybercontroller {
-
-enum class WriteKind : uint8_t { Atvv, Control, Data };
-struct WriteEvent {
-    WriteKind kind;
-    uint16_t size;
-    std::array<uint8_t, 512> bytes;
-    uint32_t session;
-};
 
 class Ble final : public NimBLEServerCallbacks, public NimBLECharacteristicCallbacks {
 public:

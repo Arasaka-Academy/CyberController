@@ -2,16 +2,39 @@
 #include <esp_heap_caps.h>
 #include <cmath>
 
+#ifdef CYBERCONTROLLER_ATOMS3_PYRAMID
+#include "wifi.hpp"
+#else
 #include "ble.hpp"
+#endif
+#include "profile.hpp"
+#ifdef CYBERCONTROLLER_ATOMS3_PYRAMID
+#include "devices/atoms3_pyramid.hpp"
+#else
 #include "devices/sticks3.hpp"
+#endif
 #include "cybercontroller/playback.hpp"
 
 using namespace cybercontroller;
 
-static void* audioAllocate(size_t size) { return heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT); }
+static void* audioAllocate(size_t size) { return heap_caps_malloc(size,
+#ifdef CYBERCONTROLLER_ATOMS3_PYRAMID
+MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
+#else
+MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
+#endif
+); }
+#ifdef CYBERCONTROLLER_ATOMS3_PYRAMID
+static AtomS3Pyramid device;
+#else
 static StickS3 device;
-static Ble ble;
-static Playback playback(audioAllocate, heap_caps_free);
+#endif
+#ifdef CYBERCONTROLLER_ATOMS3_PYRAMID
+static Wifi transport;
+#else
+static Ble transport;
+#endif
+static Playback playback(audioAllocate, heap_caps_free, maxPlaybackSamples);
 static ImaAdpcm encoder;
 static State state = State::Disconnected;
 static bool negotiated = false, wasConnected = false, held = false, requested = false, serialHeld = false;
@@ -21,30 +44,44 @@ static uint8_t stream = 0;
 static uint32_t recordingStarted = 0, requestStarted = 0, playbackStarted = 0, lastDisplay = 0;
 static uint32_t playbackTimeout = 0;
 static std::array<int16_t, 240> frame{};
-static char detail[96] = "Hold B for explicit pairing";
+static char detail[96] = "Explicit pairing required";
 
 static void transition(State next, const char* message) {
     state = next;
     snprintf(detail, sizeof(detail), "%s", message);
-    device.display(state, detail);
+    if (transport.pairingActive()) {
+        char pairingDetail[64];
+        #ifdef CYBERCONTROLLER_ATOMS3_PYRAMID
+        snprintf(pairingDetail, sizeof(pairingDetail), "Setup: %08lu", static_cast<unsigned long>(transport.passkey()));
+#else
+        snprintf(pairingDetail, sizeof(pairingDetail), "Pairing: %06lu", static_cast<unsigned long>(transport.passkey()));
+#endif
+        device.display(state, pairingDetail);
+    } else device.display(state, detail);
     Serial.printf("STATE %u %s\n", static_cast<unsigned>(state), detail);
 }
 
-static void interruptPlayback() {
+static uint8_t* diagnosticAudio = nullptr;
+static void stopDevicePlayback() {
     device.stopPlayback();
+    heap_caps_free(diagnosticAudio); diagnosticAudio = nullptr;
+}
+
+static void interruptPlayback() {
+    stopDevicePlayback();
     playback.cancel(playback.id());
-    if (playback.notification()) ble.sendStatus(playback.status());
+    if (playback.notification()) transport.sendStatus(playback.status());
 }
 
 static void finishRecording(bool notify) {
     for (unsigned pending = 0; pending < 2 && device.captureFrame(frame.data()); ++pending) {
         std::array<uint8_t, 120> encoded{};
         encoder.encode(frame.data(), frame.size(), encoded.data());
-        if (!ble.sendAudio(encoded.data(), encoded.size())) { device.stopCapture(); ble.disconnect(); return; }
+        if (!transport.sendAudio(encoded.data(), encoded.size())) { device.stopCapture(); transport.disconnect(); return; }
     }
     device.stopCapture(); requested = false; microphoneOpen = false; frame.fill(0);
-    if (notify) { const uint8_t ended[]{0}; if (!ble.sendControl(ended, sizeof(ended))) ble.disconnect(); }
-    transition(ble.connected() ? State::Waiting : State::Disconnected, "Recording released; no offline queue");
+    if (notify) { const uint8_t ended[]{0}; if (!transport.sendControl(ended, sizeof(ended))) transport.disconnect(); }
+    transition(transport.connected() ? State::Waiting : State::Disconnected, "Recording released; no offline queue");
     device.prepareMicrophone();
 }
 
@@ -52,12 +89,12 @@ static void inputControl(const WriteEvent& event) {
     const auto* bytes = event.bytes.data();
     if (event.size == 6 && bytes[0] == 10 && bytes[1] == 1 && bytes[2] == 0 && (bytes[5] & 2)) {
         const uint8_t capabilities[]{11, 1, 0, 2, 0, 0, 120};
-        negotiated = ble.sendControl(capabilities, sizeof(capabilities));
+        negotiated = transport.sendControl(capabilities, sizeof(capabilities));
         if (negotiated && state == State::Disconnected) transition(State::Ready, "ATVV 1.0 / 16k mono IMA ADPCM");
     } else if (event.size == 2 && bytes[0] == 12 && bytes[1] == 0 && requested && held && negotiated && state != State::Recording) {
         microphoneOpen = true;
         device.prepareMicrophone();
-        transition(State::Waiting, "Preparing microphone; keep holding A");
+        transition(State::Waiting, "Preparing mic; keep holding");
     } else if (event.size == 2 && bytes[0] == 13 && bytes[1] == stream && state == State::Recording) {
         finishRecording(false);
     }
@@ -69,6 +106,7 @@ static void outputControl(const WriteEvent& event) {
     const uint32_t id = read32(bytes + 2);
     if (bytes[1] == 1) {
         if (held || requested || state == State::Recording) { playback.fail(PlaybackError::Busy); return; }
+        if (diagnosticAudio) stopDevicePlayback();
         if (playback.start(bytes, event.size, millis())) transition(State::Receiving, "Buffering complete segment before playback");
     } else if (event.size == 6 && bytes[1] == 2) {
         if (!playback.finish(id)) return;
@@ -84,17 +122,18 @@ static void outputControl(const WriteEvent& event) {
 }
 
 static void microphoneTest() {
-    if (ble.connected()) return;
+    if (transport.connected()) return;
     interruptPlayback();
     device.prepareMicrophone();
     const uint32_t started = millis();
     transition(State::Waiting, "USB microphone test: preparing");
-    while (!device.microphoneReady() && millis() - started < 2000 && !ble.connected()) { device.update(); delay(1); }
+    while (!device.microphoneReady() && millis() - started < 2000 && !transport.connected()) { device.update(); delay(1); }
+    // Internal RAM on AtomS3 must also leave room for BLE, DMA and the display.
     auto* samples = static_cast<int16_t*>(audioAllocate(32000 * sizeof(int16_t)));
-    if (!samples || ble.connected() || !device.startCapture()) { heap_caps_free(samples); transition(State::Error, "Microphone test could not start"); return; }
+    if (!samples || transport.connected() || !device.startCapture()) { heap_caps_free(samples); transition(State::Error, "Microphone test could not start"); return; }
     transition(State::Recording, "USB microphone test: 2 seconds");
     size_t count = 0;
-    while (count < 32000 && millis() - started < 6000 && !ble.connected() && device.captureHealthy()) {
+    while (count < 32000 && millis() - started < 6000 && !transport.connected() && device.captureHealthy()) {
         if (device.captureFrame(frame.data())) {
             const size_t copied = std::min<size_t>(240, 32000 - count);
             std::memcpy(samples + count, frame.data(), copied * sizeof(int16_t)); count += copied;
@@ -102,7 +141,7 @@ static void microphoneTest() {
         delay(1);
     }
     device.stopCapture(); frame.fill(0);
-    if (count == 32000 && !ble.connected()) {
+    if (count == 32000 && !transport.connected()) {
         std::array<uint8_t, 44> header{};
         std::memcpy(header.data(), "RIFF", 4); write32(header.data() + 4, 64036);
         std::memcpy(header.data() + 8, "WAVEfmt ", 8); write32(header.data() + 16, 16);
@@ -113,7 +152,7 @@ static void microphoneTest() {
         Serial.printf("\nMIC_TEST samples=32000 duration_ms=%lu\n", static_cast<unsigned long>(millis() - started));
     } else Serial.println("MIC_TEST aborted; no recording retained");
     std::memset(samples, 0, 32000 * sizeof(int16_t)); heap_caps_free(samples);
-    transition(ble.connected() ? State::Ready : State::Disconnected, "USB microphone test ended"); device.prepareMicrophone();
+    transition(transport.connected() ? State::Ready : State::Disconnected, "USB microphone test ended"); device.prepareMicrophone();
 }
 
 static void serialCommand() {
@@ -124,12 +163,12 @@ static void serialCommand() {
         if (character == '\r') continue;
         if (character != '\n') { if (length < sizeof(command) - 1) command[length++] = character; continue; }
         command[length] = 0; length = 0;
-        if (!strcmp(command, "PAIR")) ble.pairing();
-        else if (!strcmp(command, "MIC_TEST") && !ble.connected()) microphoneTest();
+        if (!strcmp(command, "PAIR")) transport.pairing();
+        else if (!strcmp(command, "MIC_TEST") && !transport.connected()) microphoneTest();
         else if (!strcmp(command, "PTT 1")) serialHeld = true;
         else if (!strcmp(command, "PTT 0")) serialHeld = false;
-        else if (!strcmp(command, "STATUS")) { Serial.printf("STATUS connected=%u negotiated=%u state=%u flash=%u psram=%u free_psram=%u heap=%u\n", ble.connected(), negotiated, static_cast<unsigned>(state), ESP.getFlashChipSize(), ESP.getPsramSize(), ESP.getFreePsram(), ESP.getFreeHeap()); ble.printStatus(); }
-        else if (!strcmp(command, "SPEAKER_TEST") && !ble.connected()) {
+        else if (!strcmp(command, "STATUS")) { Serial.printf("STATUS connected=%u negotiated=%u state=%u flash=%u psram=%u free_psram=%u heap=%u\n", transport.connected(), negotiated, static_cast<unsigned>(state), ESP.getFlashChipSize(), ESP.getPsramSize(), ESP.getFreePsram(), ESP.getFreeHeap()); transport.printStatus(); }
+        else if (!strcmp(command, "SPEAKER_TEST") && !transport.connected()) {
             interruptPlayback();
             auto* encoded = static_cast<uint8_t*>(audioAllocate(8000));
             if (encoded) {
@@ -140,8 +179,9 @@ static void serialCommand() {
                 }
                 playbackStarted = millis();
                 playbackTimeout = 6000;
+                diagnosticAudio = encoded;
                 if (device.play(encoded, 16000, 10)) transition(State::Playing, "Local 440 Hz test; low volume (10%)");
-                heap_caps_free(encoded);
+                else stopDevicePlayback();
             }
         }
     }
@@ -149,37 +189,38 @@ static void serialCommand() {
 
 void setup() {
     Serial.begin(115200);
-    if (!device.begin()) { transition(State::Error, "N8R8 PSRAM or device initialization failed"); return; }
-    if (!ble.begin()) { transition(State::Error, "BLE initialization/advertising failed"); return; }
+    if (!device.begin()) { transition(State::Error, "Device initialization failed"); return; }
+    Serial.printf("DEVICE %s max_segment_samples=%lu\n", deviceName, static_cast<unsigned long>(maxPlaybackSamples));
+    if (!transport.begin()) { transition(State::Error, "Transport initialization failed"); return; }
     initialized = true;
-    transition(State::Disconnected, "Hold B 2s to pair; USB PAIR also explicit");
+    transition(State::Disconnected, pairingHint);
 }
 
 void loop() {
     if (!initialized) { delay(100); return; }
     device.update();
-    ble.tick(); serialCommand();
-    if (device.pairRequested()) ble.pairing();
-    const bool changed = ble.sessionChanged();
-    const bool connected = ble.connected();
+    transport.tick(); serialCommand();
+    if (device.pairRequested()) transport.pairing();
+    const bool changed = transport.sessionChanged();
+    const bool connected = transport.connected();
     if (changed || connected != wasConnected) {
         wasConnected = connected;
-        device.stopCapture(); device.stopPlayback(); playback.fail(PlaybackError::Disconnected);
+        device.stopCapture(); stopDevicePlayback(); playback.fail(PlaybackError::Disconnected);
         playback.notification(); // Never deliver the old session's status to a new peer.
         negotiated = false; requested = false; microphoneOpen = false; serialHeld = false; frame.fill(0);
         held = device.talkPressed();
         transition(connected ? State::Ready : State::Disconnected,
-            connected ? "Encrypted bonded connection; waiting ATVV" : "Disconnected: recording and playback discarded");
+            connected ? "Connected; preparing voice protocol" : "Disconnected: recording and playback discarded");
         device.prepareMicrophone();
     }
-    if (ble.overflowed()) { device.stopCapture(); interruptPlayback(); ble.disconnect(); transition(State::Error, "BLE queue overflow; recording discarded"); }
+    if (transport.overflowed()) { device.stopCapture(); interruptPlayback(); transport.disconnect(); transition(State::Error, "Transport queue overflow; recording discarded"); }
     const bool pressed = device.talkPressed() || serialHeld;
     if (pressed && !held) {
         interruptPlayback();
         device.prepareMicrophone();
-        if (connected && negotiated && ble.atvvSubscribed()) {
+        if (connected && negotiated && transport.atvvSubscribed()) {
             const uint8_t start[]{8};
-            requested = ble.sendControl(start, sizeof(start)); requestStarted = millis();
+            requested = transport.sendControl(start, sizeof(start)); requestStarted = millis();
             transition(State::Waiting, "Requesting microphone");
         } else transition(State::Disconnected, "Not ready; offline audio is not retained");
     }
@@ -188,53 +229,68 @@ void loop() {
         if (state == State::Recording) finishRecording(true); else { requested = false; microphoneOpen = false; transition(State::Ready, "Released before microphone opened"); }
     }
     WriteEvent event;
-    while (ble.connected() && ble.pop(event)) {
+    while (transport.connected() && transport.pop(event)) {
         if (event.kind == WriteKind::Atvv) inputControl(event);
         else if (event.kind == WriteKind::Control) outputControl(event);
         else playback.append(event.bytes.data(), event.size);
+        // An adapter may borrow the verified compressed buffer for incremental decoding.
+        // Stop before another queued event can replace a failed/cancelled segment.
+        if (playback.state() == PlaybackState::Error || playback.state() == PlaybackState::Cancelled)
+            stopDevicePlayback();
     }
     if (microphoneOpen && held && device.microphoneReady() && state != State::Recording) {
         microphoneOpen = false;
-        if (!device.startCapture()) { transition(State::Error, "Microphone start failed"); ble.disconnect(); return; }
+        if (!device.startCapture()) { transition(State::Error, "Microphone start failed"); transport.disconnect(); return; }
         ++stream; encoder = ImaAdpcm();
         const uint8_t opened[]{4, 0, 0, stream};
         const uint8_t sync[]{10, 0, 0, stream, 0, 0, 0};
-        if (!ble.sendControl(opened, sizeof(opened)) || !ble.sendControl(sync, sizeof(sync))) { device.stopCapture(); ble.disconnect(); return; }
+        if (!transport.sendControl(opened, sizeof(opened)) || !transport.sendControl(sync, sizeof(sync))) { device.stopCapture(); transport.disconnect(); return; }
         recordingStarted = millis();
-        transition(State::Recording, "Release A to send");
+        transition(State::Recording, "Release button to send");
     }
     if (state == State::Recording) {
-        if (!device.captureHealthy()) { device.stopCapture(); ble.disconnect(); transition(State::Error, "Microphone overrun; recording discarded"); }
+        if (!device.captureHealthy()) { device.stopCapture(); transport.disconnect(); transition(State::Error, "Microphone overrun; recording discarded"); }
         else if (device.captureFrame(frame.data())) {
             std::array<uint8_t, 120> encoded{};
             encoder.encode(frame.data(), frame.size(), encoded.data());
-            if (!ble.sendAudio(encoded.data(), encoded.size())) { device.stopCapture(); ble.disconnect(); transition(State::Error, "ATVV delivery failed; recording discarded"); }
+            if (!transport.sendAudio(encoded.data(), encoded.size())) { device.stopCapture(); transport.disconnect(); transition(State::Error, "ATVV delivery failed; recording discarded"); }
         }
         if (millis() - recordingStarted >= 30000 && state == State::Recording) finishRecording(true);
     }
     if (requested && state != State::Recording && millis() - requestStarted >= 5000) { requested = false; microphoneOpen = false; transition(State::Error, "ATVV microphone open timed out"); }
     playback.tick(millis());
     if (state == State::Playing) {
-        if (device.playbackFinished()) {
+        if (!device.playbackHealthy()) {
+            stopDevicePlayback(); playback.fail(PlaybackError::Audio);
+        } else if (device.playbackFinished()) {
+            stopDevicePlayback();
             playback.completed();
             Serial.printf("PLAYBACK completed id=%lu duration_ms=%lu\n", static_cast<unsigned long>(playback.id()), static_cast<unsigned long>(millis() - playbackStarted));
             transition(connected ? State::Ready : State::Disconnected, "Speaker playback complete"); device.prepareMicrophone();
         } else if (millis() - playbackStarted >= playbackTimeout) playback.fail(PlaybackError::Timeout);
     }
     if (playback.notification()) {
-        ble.sendStatus(playback.status());
+        transport.sendStatus(playback.status());
         if (playback.state() == PlaybackState::Error) {
-            device.stopPlayback();
+            stopDevicePlayback();
             if (state != State::Recording) {
                 transition(State::Error, playback.error() == PlaybackError::Timeout ? "Playback timed out; buffer cleared" : "Playback rejected; buffer cleared");
                 device.prepareMicrophone();
             }
         }
     }
-    if (ble.pairingActive() && millis() - lastDisplay >= 500) {
+    static bool pairingShown = false;
+    if (pairingShown && !transport.pairingActive()) { device.display(state, detail); pairingShown = false; }
+    if (transport.pairingActive() && millis() - lastDisplay >= 500) {
+        pairingShown = true;
         lastDisplay = millis();
-        snprintf(detail, sizeof(detail), "Pairing 60s / passkey: %06lu", static_cast<unsigned long>(ble.passkey()));
-        device.display(state, detail);
+        char pairingDetail[64];
+        #ifdef CYBERCONTROLLER_ATOMS3_PYRAMID
+        snprintf(pairingDetail, sizeof(pairingDetail), "Setup: %08lu", static_cast<unsigned long>(transport.passkey()));
+#else
+        snprintf(pairingDetail, sizeof(pairingDetail), "Pairing: %06lu", static_cast<unsigned long>(transport.passkey()));
+#endif
+        device.display(state, pairingDetail);
     }
     delay(1);
 }

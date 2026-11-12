@@ -42,9 +42,9 @@ static NimBLECharacteristic& characteristic(const char* uuid) {
 }
 
 static void reset() {
-    device.stopCapture(); device.stopPlayback();
+    device.stopCapture(); stopDevicePlayback();
     playback.cancel(playback.id()); playback.notification();
-    ble.~Ble(); new (&ble) Ble;
+    transport.~Ble(); new (&transport) Ble;
     NimBLEDevice::server = NimBLEServer{};
     NimBLEDevice::securityPasskey = 123456; NimBLEDevice::knownBond = true;
     NimBLEDevice::secureBond = true;
@@ -102,7 +102,7 @@ static void requiresSecureConnections() {
 }
 
 static void rejectsRepairOutsideWindow() {
-    ble.pairing(); connect(false); CHECK(ble.connected()); CHECK(!ble.pairingActive());
+    transport.pairing(); connect(false); CHECK(transport.connected()); CHECK(!transport.pairingActive());
     NimBLEDevice::server.callbacks->onDisconnect(&NimBLEDevice::server, peer, 0);
     NimBLEDevice::knownBond = true;
     NimBLEDevice::server.disconnected = false;
@@ -110,7 +110,7 @@ static void rejectsRepairOutsideWindow() {
     displayPasskey();
     NimBLEDevice::server.callbacks->onAuthenticationComplete(peer);
     CHECK(NimBLEDevice::server.disconnected);
-    CHECK(!ble.connected());
+    CHECK(!transport.connected());
 }
 
 static void discardsRecordingAcrossFastReconnect() {
@@ -150,35 +150,35 @@ static void rejectsStoredLegacyBond() {
     NimBLEDevice::secureBond = false;
     connect();
     CHECK(NimBLEDevice::server.disconnected);
-    CHECK(!ble.connected());
+    CHECK(!transport.connected());
 }
 
 static void permitsBondedReconnectWithoutPairing() {
-    connect(); CHECK(ble.connected()); CHECK(!NimBLEDevice::server.disconnected);
+    connect(); CHECK(transport.connected()); CHECK(!NimBLEDevice::server.disconnected);
     NimBLEDevice::server.callbacks->onAuthenticationComplete(peer);
-    CHECK(ble.connected());
+    CHECK(transport.connected());
 }
 
 static void rejectsExpiredPairing() {
-    ble.pairing(); NimBLEDevice::knownBond = false;
+    transport.pairing(); NimBLEDevice::knownBond = false;
     NimBLEDevice::server.callbacks->onConnect(&NimBLEDevice::server, peer);
     displayPasskey(); hardware::now += 60000;
     NimBLEDevice::server.callbacks->onAuthenticationComplete(peer);
-    CHECK(NimBLEDevice::server.disconnected && !ble.connected());
-    ble.tick(); CHECK(ble.passkey() == 0);
+    CHECK(NimBLEDevice::server.disconnected && !transport.connected());
+    transport.tick(); CHECK(transport.passkey() == 0);
 }
 
 static void rejectsRotatedPairingKey() {
-    ble.pairing(); NimBLEDevice::knownBond = false;
+    transport.pairing(); NimBLEDevice::knownBond = false;
     NimBLEDevice::server.callbacks->onConnect(&NimBLEDevice::server, peer);
-    displayPasskey(); ble.pairing();
+    displayPasskey(); transport.pairing();
     NimBLEDevice::server.callbacks->onAuthenticationComplete(peer);
-    CHECK(NimBLEDevice::server.disconnected && !ble.connected());
+    CHECK(NimBLEDevice::server.disconnected && !transport.connected());
 }
 
 static void rejectsShortEncryptionKey() {
     peer.keySize = 8; connect();
-    CHECK(NimBLEDevice::server.disconnected && !ble.connected());
+    CHECK(NimBLEDevice::server.disconnected && !transport.connected());
 }
 
 static void blocksAudioBeforeNewSessionIsConsumed() {
@@ -186,7 +186,7 @@ static void blocksAudioBeforeNewSessionIsConsumed() {
     NimBLEDevice::server.callbacks->onDisconnect(&NimBLEDevice::server, peer, 0);
     connect(); subscribe();
     const uint8_t audio[]{1, 2, 3};
-    CHECK(!ble.sendAudio(audio, sizeof(audio)));
+    CHECK(!transport.sendAudio(audio, sizeof(audio)));
     CHECK(characteristic(atvvAudio).notifications.empty());
 }
 
@@ -194,7 +194,7 @@ static void abandonsStatusAfterRetryDeadline() {
     ready(); characteristic(playbackStatus).failures = 1000;
     write(playbackControl, {1, 1, 42, 0, 0, 0, 3, 0, 0, 0, 2, 0, 0, 0, 0xff, 0x12, 0xd9, 0x41, 5, 1}); loop();
     hardware::now += 5000; loop();
-    CHECK(NimBLEDevice::server.disconnected && !ble.connected());
+    CHECK(NimBLEDevice::server.disconnected && !transport.connected());
     CHECK(playback.audio() == nullptr);
 }
 
@@ -234,7 +234,7 @@ static void timesOutPlaybackAcrossClockWrap() {
 static void doesNotDisconnectAtvvOnlyRecording() {
     ready(false); hardware::button = true; loop(); write(atvvTx, {12, 0}); loop();
     hardware::now += 6000; loop();
-    CHECK(ble.connected() && hardware::capturing);
+    CHECK(transport.connected() && hardware::capturing);
     CHECK(!NimBLEDevice::server.disconnected);
 }
 
@@ -254,17 +254,41 @@ static void discardsOldQueueOverflowOnReconnect() {
     for (unsigned index = 0; index < 17; ++index) write(atvvTx, {10, 1, 0, 0, 3, 3});
     NimBLEDevice::server.callbacks->onDisconnect(&NimBLEDevice::server, peer, 0);
     connect(); subscribe(); loop();
-    CHECK(ble.connected());
+    CHECK(transport.connected());
     CHECK(!NimBLEDevice::server.disconnected);
+}
+
+static void stopsBorrowedAudioBeforeNextQueuedSegment() {
+    ready(); startPlayback();
+    write(playbackData, {99, 0, 0, 0, 0, 0, 0, 0, 0});
+    write(playbackControl, {1, 1, 43, 0, 0, 0, 3, 0, 0, 0, 2, 0, 0, 0, 0xff, 0x12, 0xd9, 0x41, 5, 1});
+    loop();
+    CHECK(!hardware::speaker);
+    CHECK(playback.id() == 43 && playback.state() == PlaybackState::Receiving);
+}
+
+static void retainsDiagnosticAudioUntilStop() {
+    reset();
+    diagnosticAudio = static_cast<uint8_t*>(audioAllocate(8));
+    CHECK(diagnosticAudio); diagnosticAudio[0] = 0x12;
+    CHECK(device.play(diagnosticAudio, 16, 10));
+    state = State::Playing; playbackStarted = millis(); playbackTimeout = 6000;
+    loop(); CHECK(diagnosticAudio && diagnosticAudio[0] == 0x12);
+    hardware::speakerFinished = true; loop(); CHECK(diagnosticAudio == nullptr);
+    diagnosticAudio = static_cast<uint8_t*>(audioAllocate(8));
+    CHECK(device.play(diagnosticAudio, 16, 10));
+    interruptPlayback(); CHECK(diagnosticAudio == nullptr && !hardware::speaker);
 }
 
 int main() {
     const std::pair<const char*, void (*)()> tests[]{
+        {"stops borrowed audio before replacing a failed segment", stopsBorrowedAudioBeforeNextQueuedSegment},
         {"requires Secure Connections", requiresSecureConnections},
         {"rejects re-pairing outside the window", rejectsRepairOutsideWindow},
         {"discards recording across fast reconnect", discardsRecordingAcrossFastReconnect},
         {"retries failed status", retriesFailedStatus},
         {"stops a stalled speaker", stopsStalledSpeaker},
+        {"retains diagnostic audio until completion or cancel", retainsDiagnosticAudioUntilStop},
         {"rejects a stored Legacy bond", rejectsStoredLegacyBond},
         {"permits a bonded reconnect without pairing", permitsBondedReconnectWithoutPairing},
         {"rejects expired pairing and clears the code", rejectsExpiredPairing},

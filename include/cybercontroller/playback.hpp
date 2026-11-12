@@ -28,7 +28,8 @@ class Playback {
 public:
     using Allocate = void* (*)(size_t);
     using Release = void (*)(void*);
-    explicit Playback(Allocate allocate = std::malloc, Release release = std::free) : allocate_(allocate), release_(release) {}
+    explicit Playback(Allocate allocate = std::malloc, Release release = std::free, uint32_t maxSamples = 16000 * 130)
+        : maxSamples_(maxSamples), allocate_(allocate), release_(release) {}
     ~Playback() { clear(); }
     Playback(const Playback&) = delete;
     Playback& operator=(const Playback&) = delete;
@@ -42,7 +43,7 @@ public:
         checksum_ = read32(packet + 14);
         volume_ = packet[18];
         received_ = sequence_ = 0;
-        if (id_ == 0 || samples_ == 0 || samples_ > 16000 * 130 || length_ > 2 * 1024 * 1024
+        if (id_ == 0 || samples_ == 0 || samples_ > maxSamples_ || length_ > 2 * 1024 * 1024
             || length_ != (samples_ + 1) / 2 || volume_ > 100 || packet[19] != 1) return fail(PlaybackError::Invalid);
         clear();
         audio_ = static_cast<uint8_t*>(allocate_(length_));
@@ -104,6 +105,7 @@ private:
         if (audio_) { std::memset(audio_, 0, length_); release_(audio_); audio_ = nullptr; }
         ready_ = false;
     }
+    uint32_t maxSamples_;
     Allocate allocate_;
     Release release_;
     uint8_t* audio_ = nullptr;

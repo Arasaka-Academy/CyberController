@@ -1,6 +1,6 @@
 # CyberController
 
-CyberController 是面向 CyberOS / CyberMachine 的设备端控制器。首个设备适配器是
+CyberController 是面向 CyberOS / CyberMachine 的设备端控制器。设备适配器包括普通 AtomS3 + Voice Pyramid，以及
 M5Stack StickS3（ESP32-S3 N8R8、ES8311、AW8737）。不使用 Wi-Fi、A2DP 或 HID，
 不保存 CyberAudio 地址、Token 或模型配置。
 
@@ -81,3 +81,41 @@ USB 串口 115200，每条命令以换行结束：
 
 本次构建、烧录、主机整包升级的证据与未完成实机验收项见
 `docs/validation-2026-11-04.md`。当前不能宣称双向语音闭环已经打通。
+
+## AtomS3 + Voice Pyramid（Wi-Fi）
+
+普通 AtomS3（8 MB Flash、无 PSRAM）使用独立构建；StickS3 继续使用原 BLE 目标：
+
+```sh
+pio run -e atoms3-pyramid
+pio run -e sticks3
+pio run -e atoms3-pyramid -t upload --upload-port /dev/cu.usbmodem3101
+```
+
+烧录前先确认 USB 身份并私有备份完整 Flash/NVS；端口可能变化。使用构建工具的默认烧录参数，不要将 bootloader 的 DIO 头强行改成 QIO。
+Voice Pyramid 底部 USB-C 负责供电，AtomS3 USB 用于烧录和诊断。
+
+首次启动自动开启 **CyberController-Setup** 热点，屏幕显示八位密码。手机连接后打开
+`http://192.168.4.1/`，填写 Wi-Fi 名称/密码、CyberOS 的局域网 `http://主机[:端口]` 地址及独立设备访问令牌。
+保存到 NVS 后热点关闭并连接 CyberOS；长按 TP1 两秒可重新配网，必须松开才能再次触发。
+有已保存配置时，手动热点五分钟后返回原配置；首次配网一直等待保存。首版不支持 HTTPS、IPv6 字面地址或地址子路径。
+设备通过 WebSocket `/api/audio/device` 主动连接主机，不使用 BLE、A2DP 或设备直连模型服务。
+
+CyberOS 需在 API 服务环境中配置至少 32 位随机 `CYBEROS_WIFI_VOICE_TOKEN`（字母、数字、`_`、`-`），
+未配置时设备端点保持关闭。手机填写同一个令牌，不能填写 CyberAudio 的 Token。
+API 保持 loopback 监听，局域网通过既有 Nginx 入口接入。首版用于可信局域网；设备 HTTP/WebSocket 连接不加密。
+
+按住屏幕按键，进入 Recording 后说话，松开发送。复用 CyberOS 的持久语音会话、ASR、Agent、TTS、历史和审批；
+按下立即停止旧播报，不取消 Agent。断连丢弃未提交录音，抑制本轮尚未播放的回复，不自动重试或改投其他扬声器。
+TP1 不承担审批或音量操作。USB `PAIR` 兼容命令打开配网，`STATUS`、`MIC_TEST`、`SPEAKER_TEST` 保留。
+
+官方 M5Echo-Pyramid 驱动固定于 `773d837cb1e30452a6e4e8b02de1ad6b97eeffd2`。
+16 kHz I2S：SDA38、SCL39、BCLK6、WS8、ESP TX7/RX5，采集左麦克风声道。
+网络运行在独立任务，输入输出队列各八帧；音频主循环不执行连接重试。
+静态 RAM 约 53 KiB，压缩缓冲最多 64 KiB（131072 样本 / 8.192 秒），收齐并验证 CRC 后增量解码，
+不分配整段 PCM，不暂存音频到 Flash。四个 240 帧 DMA 缓冲采用非阻塞读写，实际发送回调确认排空才报告完成。
+每段独立编码和播放 ID，主机等上一段 COMPLETED 后发下一段；总音频最多 130 秒，允许段间等待。
+
+音量百分比映射到 codec 0–25%，首轮使用 `SPEAKER_TEST` 的 10% 输入值。驱动完成不代表人工听音通过。
+灯效：断连灰、就绪绿、录音红、等待黄、接收蓝、播放青、错误粉红；配网紫色优先。
+自动检查、Flash 备份和实机记录见 [2026-11-12 验收记录](docs/validation-2026-11-12-atoms3-pyramid.md)。

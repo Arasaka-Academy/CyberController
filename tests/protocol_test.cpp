@@ -1,3 +1,4 @@
+#include "cybercontroller/wifi_address.hpp"
 #include <array>
 #include <cassert>
 #include <cstdint>
@@ -16,6 +17,16 @@ static std::array<uint8_t, 20> startPacket(uint32_t id = 42) {
 }
 
 int main() {
+    {
+        cybercontroller::WifiAddress address;
+        assert(cybercontroller::parseWifiAddress("http://192.168.1.10", address));
+        assert(address.host == "192.168.1.10" && address.port == 80);
+        assert(cybercontroller::parseWifiAddress("http://cyberos.local:8080/", address));
+        assert(address.host == "cyberos.local" && address.port == 8080);
+        for (const char* invalid : {"https://host", "http://", "http://user@host", "http://host/path", "http://host:0", "http://host:65536", "http://host:80\r\nX:injected", "http://[::1]", "http://host?token=x"})
+            assert(!cybercontroller::parseWifiAddress(invalid, address));
+    }
+
     assert(crc32(reinterpret_cast<const uint8_t*>("123456789"), 9) == 0xcbf43926);
     ImaAdpcm encoder;
     std::array<int16_t, 6> reference{1, 4, 15, 17, -8, -64};
@@ -141,4 +152,19 @@ int main() {
     assert(receiver.error() == PlaybackError::Timeout);
     assert(receiver.audio() == nullptr);
     assert(!receiver.start(nullptr, 0, 0));
+    // Enforce no-PSRAM device limits before invoking its allocator.
+    bool allocated = false;
+    static bool* allocationFlag = nullptr;
+    allocationFlag = &allocated;
+    Playback bounded([](size_t size) -> void* { *allocationFlag = true; return std::malloc(size); }, std::free, 131072);
+    auto limitPacket = startPacket(54);
+    write32(limitPacket.data() + 6, 131073);
+    write32(limitPacket.data() + 10, 65537);
+    assert(!bounded.start(limitPacket.data(), limitPacket.size(), 0));
+    assert(!allocated && bounded.error() == PlaybackError::Invalid);
+    write32(limitPacket.data() + 6, 131072);
+    write32(limitPacket.data() + 10, 65536);
+    assert(bounded.start(limitPacket.data(), limitPacket.size(), 0));
+    assert(allocated); bounded.cancel(54); assert(bounded.audio() == nullptr);
+
 }

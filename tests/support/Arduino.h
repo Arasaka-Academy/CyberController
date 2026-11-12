@@ -14,6 +14,7 @@ inline uint32_t now = 100;
 inline bool button = false, capturing = false, speaker = false, speakerFinished = false;
 inline unsigned frames = 0;
 inline void (*onPrepare)() = nullptr;
+inline void (*onQueuePeek)() = nullptr;
 struct Queue { size_t capacity, size; std::deque<std::vector<uint8_t>> values; };
 inline std::vector<std::unique_ptr<Queue>> queues;
 }
@@ -36,6 +37,12 @@ inline int xQueueReceive(QueueHandle_t queue, void* value, unsigned) {
     if (queue->values.empty()) return 0;
     std::memcpy(value, queue->values.front().data(), queue->size);
     queue->values.pop_front();
+    return pdTRUE;
+}
+inline int xQueuePeek(QueueHandle_t queue, void* value, unsigned) {
+    if (hardware::onQueuePeek) { const auto hook = hardware::onQueuePeek; hardware::onQueuePeek = nullptr; hook(); }
+    if (queue->values.empty()) return 0;
+    std::memcpy(value, queue->values.front().data(), queue->size);
     return pdTRUE;
 }
 inline void xQueueReset(QueueHandle_t queue) { queue->values.clear(); }
