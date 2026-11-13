@@ -17,7 +17,9 @@ int main() {
     pyramidHardware::touch = true; hardware::now += 20; device.update();
     hardware::now += 2000; device.update(); CHECK(device.pairRequested());
     pyramidHardware::touch = false;
-    CHECK(device.startCapture());
+    pyramidHardware::incoming.assign(960, 0x7f); // Idle DMA samples must never become the new recording.
+    CHECK(device.startCapture()); CHECK(pyramidHardware::incoming.empty());
+    CHECK(pyramidHardware::txRunning && pyramidHardware::muted);
     std::array<int16_t, 480> input{};
     for (unsigned i=0; i<240; ++i) { input[2*i]=i; input[2*i+1]=-100; }
     const auto* raw = reinterpret_cast<const uint8_t*>(input.data());
@@ -27,7 +29,7 @@ int main() {
     CHECK(!device.captureFrame(frame.data())); CHECK(device.captureFrame(frame.data()));
     for (unsigned i=0; i<240; ++i) CHECK(frame[i] == static_cast<int16_t>(i));
     pyramidCallbacks.on_recv_q_ovf(nullptr, nullptr, pyramidContext);
-    CHECK(!device.captureHealthy()); device.stopCapture();
+    CHECK(!device.captureHealthy()); device.stopCapture(); CHECK(!pyramidHardware::txRunning);
     CHECK(device.startCapture()); CHECK(device.captureHealthy());
     pyramidHardware::readFailure = true; device.captureFrame(frame.data()); CHECK(!device.captureHealthy());
     pyramidHardware::readFailure = false; device.stopCapture();

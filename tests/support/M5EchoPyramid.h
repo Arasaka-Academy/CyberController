@@ -2,7 +2,7 @@
 #include "Arduino.h"
 #include <array>
 namespace pyramidHardware {
-inline bool touch = false, chips = true, muted = true, amplifierAwake = false;
+inline bool touch = false, chips = true, muted = true, amplifierAwake = false, txRunning = false;
 inline unsigned volume = 0, pending = 0;
 inline size_t writeLimit = 960, readLimit = 960;
 inline bool writeFailure = false, readFailure = false;
@@ -48,8 +48,9 @@ inline Channels I2S_CHANNEL_DEFAULT_CONFIG(int, int) { return {}; }
 struct i2s_std_config_t { int clk_cfg=0, slot_cfg=0; struct { int mclk=0,bclk=0,ws=0,dout=0,din=0; } gpio_cfg; };
 inline int I2S_STD_CLK_DEFAULT_CONFIG(int value) { return value; }
 inline int I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(int, int) { return 0; }
+inline i2s_chan_handle_t testTx = nullptr;
 inline int i2s_new_channel(Channels*, i2s_chan_handle_t* tx, i2s_chan_handle_t* rx) {
-    static int a, b; *tx=&a; *rx=&b; return ESP_OK;
+    static int a, b; *tx=&a; *rx=&b; testTx=*tx; return ESP_OK;
 }
 inline int i2s_channel_register_event_callback(i2s_chan_handle_t, i2s_event_callbacks_t* cb, void* ctx) {
     if (cb->on_sent) { pyramidTxCallbacks=*cb; pyramidTxContext=ctx; }
@@ -58,8 +59,8 @@ inline int i2s_channel_register_event_callback(i2s_chan_handle_t, i2s_event_call
 }
 inline int i2s_channel_init_std_mode(i2s_chan_handle_t, i2s_std_config_t*) { return ESP_OK; }
 inline int i2s_channel_preload_data(i2s_chan_handle_t, const void*, size_t size, size_t* loaded) { *loaded=size; return ESP_OK; }
-inline int i2s_channel_enable(i2s_chan_handle_t) { return ESP_OK; }
-inline int i2s_channel_disable(i2s_chan_handle_t) { return ESP_OK; }
+inline int i2s_channel_enable(i2s_chan_handle_t channel) { if (channel == testTx) pyramidHardware::txRunning=true; return ESP_OK; }
+inline int i2s_channel_disable(i2s_chan_handle_t channel) { if (channel == testTx) pyramidHardware::txRunning=false; return ESP_OK; }
 inline int i2s_channel_read(i2s_chan_handle_t, void* output, size_t size, size_t* count, int) {
     using namespace pyramidHardware;
     *count = std::min({size, incoming.size(), readLimit});

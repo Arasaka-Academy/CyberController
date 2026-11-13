@@ -130,8 +130,8 @@ static void microphoneTest() {
     while (!device.microphoneReady() && millis() - started < 2000 && !transport.connected()) { device.update(); delay(1); }
     // Internal RAM on AtomS3 must also leave room for BLE, DMA and the display.
     auto* samples = static_cast<int16_t*>(audioAllocate(32000 * sizeof(int16_t)));
-    if (!samples || transport.connected() || !device.startCapture()) { heap_caps_free(samples); transition(State::Error, "Microphone test could not start"); return; }
     transition(State::Recording, "USB microphone test: 2 seconds");
+    if (!samples || transport.connected() || !device.startCapture()) { heap_caps_free(samples); transition(State::Error, "Microphone test could not start"); return; }
     size_t count = 0;
     while (count < 32000 && millis() - started < 6000 && !transport.connected() && device.captureHealthy()) {
         if (device.captureFrame(frame.data())) {
@@ -150,7 +150,7 @@ static void microphoneTest() {
         Serial.printf("MIC_WAV 64044\n");
         Serial.write(header.data(), header.size()); Serial.write(reinterpret_cast<uint8_t*>(samples), 64000);
         Serial.printf("\nMIC_TEST samples=32000 duration_ms=%lu\n", static_cast<unsigned long>(millis() - started));
-    } else Serial.println("MIC_TEST aborted; no recording retained");
+    } else Serial.printf("MIC_TEST aborted samples=%u healthy=%u elapsed_ms=%lu; no recording retained\n", static_cast<unsigned>(count), device.captureHealthy(), static_cast<unsigned long>(millis() - started));
     std::memset(samples, 0, 32000 * sizeof(int16_t)); heap_caps_free(samples);
     transition(transport.connected() ? State::Ready : State::Disconnected, "USB microphone test ended"); device.prepareMicrophone();
 }
@@ -240,13 +240,13 @@ void loop() {
     }
     if (microphoneOpen && held && device.microphoneReady() && state != State::Recording) {
         microphoneOpen = false;
+        transition(State::Recording, "Release button to send");
         if (!device.startCapture()) { transition(State::Error, "Microphone start failed"); transport.disconnect(); return; }
         ++stream; encoder = ImaAdpcm();
         const uint8_t opened[]{4, 0, 0, stream};
         const uint8_t sync[]{10, 0, 0, stream, 0, 0, 0};
         if (!transport.sendControl(opened, sizeof(opened)) || !transport.sendControl(sync, sizeof(sync))) { device.stopCapture(); transport.disconnect(); return; }
         recordingStarted = millis();
-        transition(State::Recording, "Release button to send");
     }
     if (state == State::Recording) {
         if (!device.captureHealthy()) { device.stopCapture(); transport.disconnect(); transition(State::Error, "Microphone overrun; recording discarded"); }

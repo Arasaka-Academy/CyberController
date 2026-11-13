@@ -27,12 +27,12 @@ public:
     void stopPlayback() override;
 private:
     bool receive();
-    static bool overflow(i2s_chan_handle_t, i2s_event_data_t*, void* context) {
+    static bool IRAM_ATTR overflow(i2s_chan_handle_t, i2s_event_data_t*, void* context) {
         auto* self = static_cast<AtomS3Pyramid*>(context);
         if (self->capturing_.load()) self->captureError_.store(true);
         return false;
     }
-    static bool sent(i2s_chan_handle_t, i2s_event_data_t*, void* context) {
+    static bool IRAM_ATTR sent(i2s_chan_handle_t, i2s_event_data_t*, void* context) {
         static_cast<AtomS3Pyramid*>(context)->sentBuffers_.fetch_add(1, std::memory_order_relaxed);
         return false;
     }

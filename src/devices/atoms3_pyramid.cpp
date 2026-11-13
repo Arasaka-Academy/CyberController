@@ -130,6 +130,20 @@ void AtomS3Pyramid::prepareMicrophone() { if (ready_ && !playing_) codec_.mute(t
 bool AtomS3Pyramid::microphoneReady() const { return ready_ && !playing_ && millis() - microphoneStarted_ >= 1100; }
 bool AtomS3Pyramid::startCapture() {
     if (!microphoneReady()) return false;
+    // Discard queued idle samples before arming overrun detection.
+    for (unsigned i = 0; i < 5 && receive(); ++i) inputBytes_ = 0;
+    // In full-duplex mode RX shares the TX clock. Keep muted, zero-filled TX
+    // running during capture; disabling TX otherwise yields no microphone frames.
+    if (!txEnabled_) {
+        output_.fill(0);
+        for (unsigned i = 0; i < 4; ++i) {
+            size_t loaded = 0;
+            if (i2s_channel_preload_data(tx_, output_.data(), sizeof(output_), &loaded) != ESP_OK
+                || loaded != sizeof(output_)) return false;
+        }
+        if (i2s_channel_enable(tx_) != ESP_OK) return false;
+        txEnabled_ = true;
+    }
     inputBytes_ = 0; input_.fill(0); captureError_ = false; capturing_ = true;
     return true;
 }
@@ -139,7 +153,10 @@ bool AtomS3Pyramid::captureFrame(int16_t* samples) {
     input_.fill(0); inputBytes_ = 0;
     return true;
 }
-void AtomS3Pyramid::stopCapture() { capturing_ = false; inputBytes_ = 0; input_.fill(0); }
+void AtomS3Pyramid::stopCapture() {
+    capturing_ = false; inputBytes_ = 0; input_.fill(0);
+    if (txEnabled_ && !playing_) { i2s_channel_disable(tx_); txEnabled_ = false; }
+}
 
 bool AtomS3Pyramid::play(const uint8_t* encoded, uint32_t samples, uint8_t volume) {
     stopCapture(); stopPlayback();
